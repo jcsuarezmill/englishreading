@@ -14,147 +14,150 @@ from groq import Groq
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="English Ultimate V12: Coach Edition", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="English Ultimate V13 Pro", layout="wide", page_icon="🦁")
 
 # --- CSS STYLING ---
 st.markdown("""
 <style>
-    .big-font { font-size: 1.4rem; font-weight: 500; line-height: 1.6; color: #2c3e50; }
-    .coach-note { background-color: #fff3cd; padding: 15px; border-radius: 8px; border-left: 5px solid #ffc107; }
-    .metric-box {
-        background: #f8f9fa; border-radius: 8px; padding: 15px; 
-        text-align: center; border: 1px solid #e9ecef;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    .big-text { font-size: 1.3rem; line-height: 1.6; font-family: sans-serif; }
+    .highlight { background-color: #fff3cd; padding: 2px 5px; border-radius: 4px; }
+    .metric-container {
+        background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px;
+        padding: 15px; text-align: center; margin-bottom: 10px;
     }
-    .metric-val { font-size: 2rem; font-weight: 800; color: #4B0082; }
-    .metric-lbl { font-size: 0.85rem; color: #6c757d; text-transform: uppercase; letter-spacing: 1px; }
-    .stress-word { font-weight: 900; color: #d35400; text-decoration: underline; }
-    .pause-mark { color: #e74c3c; font-weight: bold; margin: 0 5px; }
+    .metric-value { font-size: 1.8rem; font-weight: 700; color: #4b0082; }
+    .metric-label { font-size: 0.8rem; text-transform: uppercase; color: #6c757d; letter-spacing: 1px; }
+    .feedback-box {
+        background-color: #e3f2fd; border-left: 5px solid #2196f3; padding: 15px; border-radius: 5px;
+    }
+    .stress { font-weight: 900; text-decoration: underline; color: #d35400; }
+    .pause { color: #c0392b; font-weight: bold; margin: 0 4px; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- API SETUP ---
+# Falls back to environment variable or placeholder if secrets not found
 try:
-    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except:
-    os.environ["GROQ_API_KEY"] = "gsk_YOUR_API_KEY_HERE" # Replace for local
-    client = Groq()
+    GROQ_API_KEY = "gsk_YOUR_API_KEY_HERE"
+
+client = Groq(api_key=GROQ_API_KEY)
 
 # --- SESSION STATE ---
 if 'practice_text' not in st.session_state: st.session_state['practice_text'] = ""
-if 'coach_notes' not in st.session_state: st.session_state['coach_notes'] = ""
-if 'audio_path' not in st.session_state: st.session_state['audio_path'] = None
+if 'coach_script' not in st.session_state: st.session_state['coach_script'] = ""
+if 'audio_ref' not in st.session_state: st.session_state['audio_ref'] = None
 
-# --- LOGIC FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 
-def generate_content(prompt_type):
-    """Generates the raw text to practice."""
-    system_prompt = "You are an English content generator. Output ONLY the raw text to be spoken. No intros."
+def generate_text(topic, emotion):
+    """Generates the raw practice text."""
+    prompt = f"Generate a short (30-40 words) English practice text about: '{topic}'. Tone: {emotion}. OUTPUT RAW TEXT ONLY."
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt_type}]
-        )
-        return completion.choices[0].message.content
+        res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}])
+        return res.choices[0].message.content.replace('"', '')
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error: {str(e)}"
 
-def generate_coach_script(text, emotion):
-    """Generates the 'How to Read' guide with stress and pauses."""
-    system_prompt = f"""
-    You are a Voice Acting Coach. 
-    Rewrite the user's text to show them HOW to read it with emotion: '{emotion}'.
-    Rules:
-    1. Bold the words that need **STRESS**.
-    2. Insert '||' where they should PAUSE.
-    3. Add (bracketed notes) for tone changes like (whisper), (loudly), (slow down).
-    Output only the marked-up text.
+def mark_script(text, emotion):
+    """Adds stress and pause markers to the text."""
+    prompt = f"""
+    Act as a Voice Coach. Mark this text for reading with emotion: {emotion}.
+    1. Bold **stressed** words.
+    2. Add || for pauses.
+    Output ONLY the marked text.
+    Text: {text}
     """
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": f"Text: {text}"}, {"role": "system", "content": system_prompt}]
-        )
-        return completion.choices[0].message.content
+        res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}])
+        return res.choices[0].message.content
     except:
         return text
 
-def analyze_physics(audio_path, transcript):
-    """Librosa analysis for WPM, Pitch, Energy."""
-    try:
-        y, sr = librosa.load(audio_path)
-        duration = librosa.get_duration(y=y, sr=sr)
-        if duration < 1: return None
-        
-        # 1. WPM
-        word_count = len(transcript.split())
-        wpm = (word_count / duration) * 60
-        
-        # 2. Pitch (Intonation)
-        f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
-        f0 = f0[~np.isnan(f0)]
-        pitch_std = np.std(f0) if len(f0) > 0 else 0
-        
-        # 3. Energy (Volume/Confidence)
-        rms = librosa.feature.rms(y=y)
-        energy = np.mean(rms)
-
-        return {
-            "wpm": int(wpm),
-            "pitch_std": round(pitch_std, 1),
-            "energy": round(energy * 1000, 0) # Scaled up for readability
-        }
-    except:
-        return None
-
-def get_ai_critique(target, spoken, metrics, emotion):
-    """The 'Real Coach' Feedback based on data."""
-    prompt = f"""
-    Act as a strict but encouraging Dialect Coach.
-    Target Text: "{target}"
-    Student Said: "{spoken}"
-    Target Emotion: {emotion}
-    
-    Data:
-    - Speed: {metrics['wpm']} WPM (Normal is 130-150)
-    - Intonation Score: {metrics['pitch_std']} (Low < 15 is monotone, High > 25 is expressive)
-    - Energy: {metrics['energy']} (Low < 10 is too quiet)
-    
-    Task:
-    1. Give a score out of 100.
-    2. Analyze their pacing and tone based on the data.
-    3. Identify exactly one word they mispronounced or swallowed.
-    4. Give 2 specific instructions for the next take.
-    """
-    res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}])
-    return res.choices[0].message.content
-
-async def generate_tts(text, gender, emotion):
+async def text_to_speech(text, gender, emotion):
+    """Generates audio file."""
     voice = "en-US-ChristopherNeural" if gender == "Male" else "en-US-AriaNeural"
-    rates = {"Neutral": "+0%", "Happy": "+10%", "Sad": "-10%", "Strict": "-5%"}
-    pitches = {"Neutral": "+0Hz", "Happy": "+5Hz", "Sad": "-5Hz", "Strict": "-2Hz"}
-    communicate = edge_tts.Communicate(text, voice, rate=rates.get(emotion, "+0%"), pitch=pitches.get(emotion, "+0Hz"))
+    # Adjusting params for emotion simulation
+    params = {
+        "Neutral": {"r": "+0%", "p": "+0Hz"},
+        "Happy":   {"r": "+10%", "p": "+5Hz"},
+        "Sad":     {"r": "-10%", "p": "-5Hz"},
+        "Strict":  {"r": "-5%", "p": "-2Hz"},
+    }
+    p = params.get(emotion, params["Neutral"])
+    
+    communicate = edge_tts.Communicate(text, voice, rate=p['r'], pitch=p['p'])
     fd, path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     await communicate.save(path)
     return path
 
-def sync_tts(text, gender, emotion):
+def sync_tts_gen(text, gender, emotion):
+    """Wrapper to run async TTS in Streamlit."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed(): loop = asyncio.new_event_loop()
-    except: loop = asyncio.new_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    return loop.run_until_complete(generate_tts(text, gender, emotion))
+    return loop.run_until_complete(text_to_speech(text, gender, emotion))
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Studio Settings")
-    gender = st.selectbox("Coach Voice", ["Male", "Female"])
-    emotion = st.selectbox("Target Emotion", ["Neutral", "Happy", "Sad", "Strict"])
+def analyze_audio_physics(file_path, transcript):
+    """Uses Librosa to extract non-linguistic features."""
+    try:
+        y, sr = librosa.load(file_path)
+        duration = librosa.get_duration(y=y, sr=sr)
+        
+        if duration < 0.5: return None
+        
+        # 1. Speaking Rate (WPM)
+        word_count = len(transcript.split())
+        wpm = (word_count / duration) * 60
+        
+        # 2. Pitch Standard Deviation (Intonation)
+        # Higher std dev = more expressive. Low = monotone.
+        f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
+        valid_f0 = f0[~np.isnan(f0)]
+        pitch_std = np.std(valid_f0) if len(valid_f0) > 0 else 0
+        
+        # 3. Energy (Loudness consistency)
+        rms = librosa.feature.rms(y=y)
+        energy_avg = np.mean(rms)
+
+        return {"wpm": int(wpm), "pitch_std": round(pitch_std, 1), "energy": round(energy_avg * 100, 1)}
+    except:
+        return None
+
+def get_coach_feedback(target, spoken, metrics, emotion):
+    """Generates the AI critique."""
+    prompt = f"""
+    You are a Strict English Coach.
+    Context:
+    - Target: "{target}"
+    - Spoken: "{spoken}"
+    - Tone Goal: {emotion}
+    - Speed: {metrics['wpm']} WPM (Ideal: 120-150)
+    - Intonation Score: {metrics['pitch_std']} (Low < 15 is Monotone)
     
+    Task:
+    1. Score /100 based on accuracy and emotion.
+    2. Did they skip any words?
+    3. Was the emotion correct? (Use the Intonation Score).
+    4. Provide ONE specific correction.
+    """
+    res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}])
+    return res.choices[0].message.content
+
+# --- SIDEBAR SETTINGS ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    gender = st.selectbox("AI Voice", ["Male", "Female"])
+    emotion = st.selectbox("Target Emotion", ["Neutral", "Happy", "Sad", "Strict"])
     st.divider()
-    with st.expander("📸 Mouth Lab (Camera)"):
+    
+    # MOUTH CAM
+    with st.expander("🎥 Mouth Shape Cam"):
         try:
             import mediapipe as mp
             mp_face_mesh = mp.solutions.face_mesh
@@ -168,98 +171,97 @@ with st.sidebar:
                             mp.solutions.drawing_utils.draw_landmarks(image=img, landmark_list=fl, connections=mp_face_mesh.FACEMESH_LIPS)
                     return img
             webrtc_streamer(key="mouth", mode=WebRtcMode.SENDRECV, video_processor_factory=MouthProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}, media_stream_constraints={"video": True, "audio": False}, async_processing=True)
-        except: st.warning("Camera unavailable.")
+        except:
+            st.warning("Camera unavailable on this server.")
 
-# --- MAIN APP ---
-st.title("🦁 English Ultimate: The Coach")
-st.caption("Generate any text -> Get Direction -> Record -> Get Real Feedback")
+# --- MAIN LAYOUT ---
+st.title("🦁 English Ultimate V13")
+st.caption("Generate. Perform. Analyze.")
 
-# 1. INPUT
-col1, col2 = st.columns([3, 1])
-with col1:
-    user_topic = st.text_input("Generate practice material:", placeholder="e.g. 'Opening lines of a TED Talk', 'Angry customer complaint', 'Romantic poem'")
-with col2:
-    if st.button("🎬 Action!", use_container_width=True):
-        if user_topic:
-            with st.spinner("Writing script..."):
-                st.session_state['practice_text'] = generate_content(user_topic)
-                st.session_state['coach_notes'] = generate_coach_script(st.session_state['practice_text'], emotion)
-                st.session_state['audio_path'] = sync_tts(st.session_state['practice_text'], gender, emotion)
+# 1. INPUT SECTION
+col_in1, col_in2 = st.columns([3, 1])
+with col_in1:
+    topic = st.text_input("What do you want to practice?", placeholder="e.g. Asking for a refund, A scary story, Ordering food")
+with col_in2:
+    if st.button("Generate Script", use_container_width=True):
+        if topic:
+            with st.spinner("Creating content..."):
+                # 1. Generate Text
+                raw_text = generate_text(topic, emotion)
+                st.session_state['practice_text'] = raw_text
+                
+                # 2. Generate Guide
+                st.session_state['coach_script'] = mark_script(raw_text, emotion)
+                
+                # 3. Generate Audio
+                st.session_state['audio_ref'] = sync_tts_gen(raw_text, gender, emotion)
+                st.rerun()
 
-# 2. SCRIPT & DIRECTION
+# 2. PRACTICE SECTION
 if st.session_state['practice_text']:
     st.divider()
     
-    # Tabs for different views
-    view_tab1, view_tab2 = st.tabs(["📄 Clean Script", "📝 Coach's Markups"])
+    # TABS FOR VIEWING
+    tab_script, tab_guide = st.tabs(["📄 Plain Text", "🎭 Acting Guide"])
     
-    with view_tab1:
-        st.markdown(f"<div class='big-font'>{st.session_state['practice_text']}</div>", unsafe_allow_html=True)
-        if st.session_state['audio_path']:
-             if st.button("🔈 Hear Ideal Performance"):
-                st.audio(st.session_state['audio_path'])
+    with tab_script:
+        st.markdown(f"<div class='big-text'>{st.session_state['practice_text']}</div>", unsafe_allow_html=True)
+        if st.session_state['audio_ref']:
+            st.audio(st.session_state['audio_ref'])
+            
+    with tab_guide:
+        st.info("💡 **Coach's Notes:** Emphasize bold words. Pause at || marks.")
+        # HTML formatting for the guide
+        formatted = st.session_state['coach_script'].replace("**", "<b>").replace("||", "<span class='pause'>||</span>")
+        formatted = formatted.replace("<b>", "<span class='stress'>").replace("</b>", "</span>")
+        st.markdown(f"<div class='big-text'>{formatted}</div>", unsafe_allow_html=True)
     
-    with view_tab2:
-        st.info("💡 **Coach's Tip:** Emphasize the **Bold** words. Pause at the || markers.")
-        # Apply simple formatting for markdown display of the notes
-        formatted_notes = st.session_state['coach_notes'].replace("**", "<b>").replace("||", "<span class='pause-mark'>||</span>")
-        formatted_notes = formatted_notes.replace("<b>", "<span class='stress-word'>").replace("</b>", "</span>")
-        st.markdown(f"<div class='big-font'>{formatted_notes}</div>", unsafe_allow_html=True)
-
-    # 3. RECORDING
     st.divider()
-    st.subheader("🎙️ Your Take")
-    audio_input = st.audio_input("Record when ready")
-
-    if audio_input:
-        with st.spinner("The Coach is listening..."):
-            # Transcribe
+    
+    # 3. RECORDING & ANALYSIS
+    st.markdown("### 🎙️ Record Your Take")
+    audio_val = st.audio_input("Microphone")
+    
+    if audio_val:
+        with st.spinner("Analyzing Physics & Linguistics..."):
+            # A. Save Temp
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(audio_input.getvalue())
+                tmp.write(audio_val.getvalue())
                 tmp_path = tmp.name
             
+            # B. Transcribe (Linguistics)
             with open(tmp_path, "rb") as f:
-                trans = client.audio.transcriptions.create(file=(tmp_path, f.read()), model="whisper-large-v3-turbo").text
+                transcription = client.audio.transcriptions.create(file=(tmp_path, f.read()), model="whisper-large-v3-turbo").text
             
-            # Physics Analysis
-            metrics = analyze_physics(tmp_path, trans)
+            # C. Analyze (Physics)
+            metrics = analyze_audio_physics(tmp_path, transcription)
             os.remove(tmp_path)
-
+            
             if metrics:
-                # 4. RESULTS DASHBOARD
-                st.markdown("### 📊 Performance Metrics")
+                # DISPLAY METRICS
                 m1, m2, m3 = st.columns(3)
-                
                 with m1:
-                    st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['wpm']}</div><div class='metric-lbl'>Speed (WPM)</div></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['wpm']}</div><div class='metric-label'>Words Per Min</div></div>", unsafe_allow_html=True)
                 with m2:
-                    st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['pitch_std']}</div><div class='metric-lbl'>Intonation (0-50)</div></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['pitch_std']}</div><div class='metric-label'>Intonation Score</div></div>", unsafe_allow_html=True)
                 with m3:
-                    st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['energy']}</div><div class='metric-lbl'>Energy Level</div></div>", unsafe_allow_html=True)
-
-                st.divider()
+                    st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['energy']}</div><div class='metric-label'>Energy Level</div></div>", unsafe_allow_html=True)
                 
-                # 5. THE AI COACH CRITIQUE
-                st.markdown("### 👨‍🏫 Coach's Verdict")
-                critique = get_ai_critique(st.session_state['practice_text'], trans, metrics, emotion)
+                # DISPLAY AI CRITIQUE
+                st.markdown("### 👨‍🏫 Coach Feedback")
+                feedback = get_coach_feedback(st.session_state['practice_text'], transcription, metrics, emotion)
+                st.markdown(f"<div class='feedback-box'>{feedback}</div>", unsafe_allow_html=True)
                 
-                # Parse the critique for better display
-                st.markdown(f"<div class='coach-note'>{critique}</div>", unsafe_allow_html=True)
-                
-                # Visual Diff
-                with st.expander("🔎 View Word-by-Word Errors"):
-                    # Quick Diff Logic
-                    target_words = st.session_state['practice_text'].lower().split()
-                    spoken_words = trans.lower().split()
-                    matcher = difflib.SequenceMatcher(None, target_words, spoken_words)
-                    html = []
-                    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                        if tag == 'replace':
-                            html.append(f"<span style='color:red;text-decoration:line-through'>{' '.join(target_words[i1:i2])}</span> <span style='color:green'>{' '.join(spoken_words[j1:j2])}</span>")
-                        elif tag == 'delete':
-                            html.append(f"<span style='color:red;text-decoration:line-through'>{' '.join(target_words[i1:i2])}</span>")
-                        elif tag == 'equal':
-                            html.append(f"<span style='color:black'>{' '.join(target_words[i1:i2])}</span>")
-                    st.markdown(" ".join(html), unsafe_allow_html=True)
+                # VISUAL DIFF
+                with st.expander("Compare Words (Literal vs Spoken)"):
+                    st.text(f"Target: {st.session_state['practice_text']}")
+                    st.text(f"You Said: {transcription}")
+                    
+                    # Simple Diff
+                    t_words = st.session_state['practice_text'].lower().translate(str.maketrans('', '', string.punctuation)).split()
+                    s_words = transcription.lower().translate(str.maketrans('', '', string.punctuation)).split()
+                    diff = difflib.SequenceMatcher(None, t_words, s_words)
+                    ratio = diff.ratio()
+                    st.progress(ratio, text=f"Accuracy Match: {int(ratio*100)}%")
             else:
-                st.error("Audio too short to analyze. Please speak longer.")
+                st.error("Audio recording was too short or silent. Please try again.")
