@@ -1,0 +1,8 @@
+streamlit
+groq
+edge-tts
+eng_to_ipa
+numpy
+opencv-python-headless
+mediapipe
+asyncio
