@@ -9,13 +9,14 @@ import numpy as np
 import eng_to_ipa as ipa
 import cv2
 import av
-import time
+import librosa
+import matplotlib.pyplot as plt
 from groq import Groq
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="English Ultimate V9 Pro",
+    page_title="English Ultimate V10 Pro",
     layout="wide",
     page_icon="🦁",
     initial_sidebar_state="expanded"
@@ -25,67 +26,88 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; color: #4B0082; text-align: center; }
-    .sub-header { font-size: 1.5rem; color: #333; margin-top: 20px; }
-    .feedback-card {
-        background-color: #f8f9fa; border-radius: 10px; padding: 20px;
-        border-left: 5px solid #6c5ce7; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+    .metric-card {
+        background-color: #f0f2f6; border-radius: 10px; padding: 15px;
+        text-align: center; border: 1px solid #dcdcdc;
     }
+    .metric-value { font-size: 1.5rem; font-weight: bold; color: #2c3e50; }
+    .metric-label { font-size: 0.9rem; color: #7f8c8d; }
     .correct { color: #27ae60; font-weight: bold; }
     .incorrect { color: #c0392b; font-weight: bold; text-decoration: line-through; }
-    .correction { color: #e67e22; font-weight: bold; font-style: italic; }
-    .ipa-text { font-family: 'Courier New', monospace; color: #7f8c8d; font-size: 0.9em; }
     .chat-user {
-        background-color: #d1ccc0; padding: 15px; border-radius: 15px 15px 0 15px;
-        margin: 10px 0; text-align: right; color: #2c3e50; float: right; clear: both; max-width: 70%;
+        background-color: #d1ccc0; padding: 10px; border-radius: 15px 15px 0 15px;
+        margin: 5px 0; text-align: right; float: right; clear: both; max-width: 70%; color: black;
     }
     .chat-ai {
-        background-color: #dff9fb; padding: 15px; border-radius: 15px 15px 15px 0;
-        margin: 10px 0; text-align: left; color: #2c3e50; float: left; clear: both; max-width: 70%;
+        background-color: #dff9fb; padding: 10px; border-radius: 15px 15px 15px 0;
+        margin: 5px 0; text-align: left; float: left; clear: both; max-width: 70%; color: black;
     }
-    .vocab-item { padding: 5px; border-bottom: 1px solid #eee; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- API & SESSION SETUP ---
+# --- API SETUP ---
 if "GROQ_API_KEY" in st.secrets:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 else:
-    # Development fallback
-    os.environ["GROQ_API_KEY"] = "gsk_YOUR_API_KEY_HERE" # Replace if running locally without secrets
+    os.environ["GROQ_API_KEY"] = "gsk_YOUR_API_KEY_HERE" # FALLBACK
     client = Groq()
 
-# Session State Initialization
-if 'vocab_list' not in st.session_state: st.session_state['vocab_list'] = []
-if 'roleplay_history' not in st.session_state: st.session_state['roleplay_history'] = []
-if 'last_audio_path' not in st.session_state: st.session_state['last_audio_path'] = None
-if 'autoplay_trigger' not in st.session_state: st.session_state['autoplay_trigger'] = False
-if 'quiz_data' not in st.session_state: st.session_state['quiz_data'] = None
+# --- MEDIA PIPE SETUP (SAFE IMPORT) ---
+try:
+    import mediapipe as mp
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    MEDIAPIPE_AVAILABLE = True
+except Exception as e:
+    MEDIAPIPE_AVAILABLE = False
+    st.error(f"Visual Feedback Warning: MediaPipe failed to load. The Mouth Lab will not work. (Error: {e})")
 
-# --- CONSTANTS ---
-TEXT_MODEL = "llama-3.1-8b-instant"
-AUDIO_MODEL = "whisper-large-v3-turbo"
+# --- CORE FUNCTIONS ---
 
-# --- HELPER FUNCTIONS ---
-
-def get_ipa(text):
-    """Convert text to IPA phonemes."""
+def analyze_prosody(audio_path, transcript):
+    """
+    Analyzes audio for pacing, pitch, and energy using Librosa (Free).
+    """
     try:
-        return ipa.convert(text)
-    except:
-        return text
+        # Load Audio
+        y, sr = librosa.load(audio_path)
+        duration = librosa.get_duration(y=y, sr=sr)
+        
+        # 1. Pacing (WPM)
+        word_count = len(transcript.split())
+        wpm = (word_count / duration) * 60
+        
+        # 2. Pitch (Fundamental Frequency - F0)
+        # We use PYIN (Probabilistic YIN) to estimate pitch
+        f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
+        # Filter out silence/unvoiced parts
+        pitch_values = f0[~np.isnan(f0)]
+        
+        if len(pitch_values) > 0:
+            avg_pitch = np.mean(pitch_values)
+            pitch_std = np.std(pitch_values) # High std = Expressive, Low std = Monotone
+        else:
+            avg_pitch = 0
+            pitch_std = 0
+            
+        # 3. Energy (Root Mean Square)
+        rms = librosa.feature.rms(y=y)
+        avg_energy = np.mean(rms)
 
-async def edge_tts_generate(text, voice, rate, pitch, output_file):
-    """Async generator for TTS."""
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await communicate.save(output_file)
+        return {
+            "duration": duration,
+            "wpm": round(wpm, 1),
+            "pitch_variability": round(pitch_std, 1),
+            "avg_pitch": round(avg_pitch, 1),
+            "energy_score": round(avg_energy, 4)
+        }
+    except Exception as e:
+        return None
 
-def generate_audio(text, gender, emotion):
-    """
-    Wrapper to handle AsyncIO loop for EdgeTTS.
-    Returns path to audio file.
-    """
+def generate_audio_sync(text, gender, emotion):
+    """Sync wrapper for TTS"""
     voice = "en-US-ChristopherNeural" if gender == "Male" else "en-US-AriaNeural"
-    
     emotions = {
         "Neutral": {"rate": "+0%", "pitch": "+0Hz"},
         "Happy":   {"rate": "+10%", "pitch": "+4Hz"},
@@ -94,375 +116,178 @@ def generate_audio(text, gender, emotion):
     }
     e = emotions.get(emotion, emotions["Neutral"])
     
-    # Create temp file
     fd, path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     
-    # Handle Async Loop safely for Streamlit
+    async def _gen():
+        communicate = edge_tts.Communicate(text, voice, rate=e['rate'], pitch=e['pitch'])
+        await communicate.save(path)
+
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        loop.run_until_complete(edge_tts_generate(text, voice, e['rate'], e['pitch'], path))
-    except RuntimeError:
-        # Fallback for when loop is already running
-        asyncio.run(edge_tts_generate(text, voice, e['rate'], e['pitch'], path))
+             asyncio.run(_gen())
+        else:
+             loop.run_until_complete(_gen())
+    except:
+        asyncio.run(_gen())
         
     return path
 
 def transcribe_audio(audio_file):
-    """Transcribes audio using Groq Whisper."""
     if audio_file is None: return ""
-    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(audio_file.read())
         tmp_name = tmp.name
-    
     try:
         with open(tmp_name, "rb") as f:
-            trans = client.audio.transcriptions.create(
-                file=(tmp_name, f.read()), 
-                model=AUDIO_MODEL,
-                language="en"
-            )
+            trans = client.audio.transcriptions.create(file=(tmp_name, f.read()), model="whisper-large-v3-turbo")
         return trans.text
     finally:
         os.remove(tmp_name)
 
-def advanced_diff(target, spoken):
-    """Generates HTML diff with IPA comparison."""
-    target_clean = target.translate(str.maketrans('', '', string.punctuation)).lower()
-    spoken_clean = spoken.translate(str.maketrans('', '', string.punctuation)).lower()
-    
-    target_words = target_clean.split()
-    spoken_words = spoken_clean.split()
-    
-    matcher = difflib.SequenceMatcher(None, target_words, spoken_words)
-    
-    html = "<div style='line-height: 2.0; font-size: 1.1em;'>"
-    phonetic_errors = []
-    
+def get_ipa(text):
+    try: return ipa.convert(text)
+    except: return text
+
+def visual_diff(target, spoken):
+    t_clean = target.translate(str.maketrans('', '', string.punctuation)).lower().split()
+    s_clean = spoken.translate(str.maketrans('', '', string.punctuation)).lower().split()
+    matcher = difflib.SequenceMatcher(None, t_clean, s_clean)
+    html = ""
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == 'equal':
-            for word in target_words[i1:i2]:
-                html += f"<span class='correct'>{word}</span> "
+            html += f"<span class='correct'>{' '.join(t_clean[i1:i2])}</span> "
         elif tag == 'replace':
-            for k in range(i2 - i1):
-                t_word = target_words[i1+k]
-                if j1+k < len(spoken_words):
-                    s_word = spoken_words[j1+k]
-                    t_ipa = get_ipa(t_word)
-                    s_ipa = get_ipa(s_word)
-                    
-                    # Phonetic similarity check
-                    if t_ipa == s_ipa:
-                        # Sounds same, just spelled different? Mark as warning/ok
-                        html += f"<span class='correct' title='Homophone match'>{t_word}</span> "
-                    else:
-                        html += f"<span class='incorrect' title='You said: {s_word}'>{t_word}</span> "
-                        phonetic_errors.append(f"**{t_word}** (/{t_ipa}/) vs **{s_word}** (/{s_ipa}/)")
-                else:
-                    html += f"<span class='incorrect'>{t_word}</span> "
+            html += f"<span class='incorrect'>{' '.join(t_clean[i1:i2])}</span> "
         elif tag == 'delete':
-            for word in target_words[i1:i2]:
-                html += f"<span class='incorrect' style='opacity:0.5'>[{word}]</span> "
-        elif tag == 'insert':
-            for word in spoken_words[j1:j2]:
-                html += f"<span class='correction'>({word})</span> "
-                
-    html += "</div>"
-    return html, phonetic_errors
+            html += f"<span style='color:orange; text-decoration:line-through'>{' '.join(t_clean[i1:i2])}</span> "
+    return html
 
 # --- WEBRTC PROCESSOR ---
-import mediapipe as mp
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+if MEDIAPIPE_AVAILABLE:
+    class MouthProcessor(VideoTransformerBase):
+        def __init__(self):
+            self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
 
-class MouthProcessor(VideoTransformerBase):
-    def __init__(self):
-        self.face_mesh = mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        def transform(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(img_rgb)
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image=img, landmark_list=face_landmarks,
+                        connections=mp_face_mesh.FACEMESH_LIPS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
+                    )
+            return img
+else:
+    class MouthProcessor(VideoTransformerBase):
+        def transform(self, frame): return frame.to_ndarray(format="bgr24")
 
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img.flags.writeable = False
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(img_rgb)
-        img.flags.writeable = True
-        
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                # Draw lips
-                mp_drawing.draw_landmarks(
-                    image=img,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_LIPS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
-                )
-        return img
+# --- UI LAYOUT ---
+st.title("🦁 English Ultimate V10 Pro")
 
-# --- MAIN APP UI ---
-
-# Sidebar
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/lion.png", width=80)
-    st.title("Settings")
-    
-    st.markdown("### 🗣️ Voice Engine")
-    gender = st.selectbox("Voice Gender", ["Male", "Female"])
-    emotion = st.selectbox("Tone", ["Neutral", "Happy", "Sad", "Strict"])
-    
-    st.divider()
-    
-    st.markdown("### 📓 Vocabulary Vault")
-    new_word = st.text_input("Add word")
-    if st.button("Save Word"):
-        if new_word and new_word not in st.session_state['vocab_list']:
-            st.session_state['vocab_list'].append(new_word)
-            st.success(f"Saved: {new_word}")
-    
-    if st.session_state['vocab_list']:
-        st.write("---")
-        for w in st.session_state['vocab_list']:
-            st.markdown(f"• **{w}** /{get_ipa(w)}/")
-        if st.button("Clear Vault"):
-            st.session_state['vocab_list'] = []
+    st.header("Settings")
+    gender = st.selectbox("Voice", ["Male", "Female"])
+    emotion = st.selectbox("Emotion", ["Neutral", "Happy", "Sad", "Strict"])
+    st.info("New: Voice Analytics Engine Added (Librosa)")
 
-# Header
-st.markdown("<h1 class='main-header'>🦁 English Ultimate V9 Pro</h1>", unsafe_allow_html=True)
+tab1, tab2, tab3 = st.tabs(["📊 Voice Analytics Lab", "🎭 Roleplay", "👄 Mouth Camera"])
 
-# Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📖 Smart Reader", 
-    "🎧 Listening Gym", 
-    "🔥 Tongue Twisters", 
-    "🎭 AI Roleplay", 
-    "👄 Mouth Lab"
-])
-
-# === TAB 1: SMART READER ===
+# === TAB 1: ANALYTICS LAB ===
 with tab1:
-    st.markdown("### 📝 Analyze Your Pronunciation")
+    st.subheader("Deep Voice Analysis")
+    st.markdown("Read the text below to analyze your Pacing, Intonation, and Pronunciation.")
     
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        user_text = st.text_area("Enter text to practice:", value="The quick brown fox jumps over the lazy dog.", height=100)
-    with col2:
-        if st.button("✨ Improve Text"):
-            with st.spinner("Refining..."):
-                prompt = f"Fix grammar and make this text sound more native: '{user_text}'. Return only the fixed text."
-                completion = client.chat.completions.create(model=TEXT_MODEL, messages=[{"role": "user", "content": prompt}])
-                user_text = completion.choices[0].message.content
-                st.info("Text refined by AI!")
-
-    # Audio Controls
-    if st.button("🔈 Listen to Native Audio"):
-        audio_path = generate_audio(user_text, gender, emotion)
-        st.audio(audio_path)
-
-    # Recording
-    st.markdown("#### 🎙️ Your Turn")
-    audio_input = st.audio_input("Record reading the text above")
+    target_text = st.text_area("Target Text", "The quick brown fox jumps over the lazy dog. It was a bright cold day in April, and the clocks were striking thirteen.")
+    
+    if st.button("Listen to Example"):
+        path = generate_audio_sync(target_text, gender, emotion)
+        st.audio(path)
+        
+    audio_input = st.audio_input("Record Analysis")
     
     if audio_input:
-        with st.spinner("Analyzing audio..."):
-            spoken = transcribe_audio(audio_input)
+        with st.spinner("Transcribing & Analyzing Physics of Audio..."):
+            # 1. Save to temp for Librosa
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(audio_input.getvalue())
+                tmp_path = tmp.name
             
-            # Visual Diff
-            diff_html, phonetics = advanced_diff(user_text, spoken)
+            # 2. Transcribe
+            spoken_text = transcribe_audio(audio_input)
             
-            st.markdown("### Result:")
-            st.markdown(diff_html, unsafe_allow_html=True)
+            # 3. Analyze Physics (Free!)
+            metrics = analyze_prosody(tmp_path, spoken_text)
+            os.remove(tmp_path)
             
-            if phonetics:
-                with st.expander("🧐 Phonetic Deep Dive"):
-                    st.write("Words you might have mispronounced:")
-                    for p in phonetics:
-                        st.markdown(f"- {p}")
+            # --- DISPLAY RESULTS ---
+            st.markdown("### 📈 Your Voice Metrics")
             
-            # AI Coach
-            with st.expander("🤖 Coach Feedback", expanded=True):
-                prompt = f"User target: '{user_text}'. User said: '{spoken}'. Give 3 bullet points on how to improve pronunciation specifically."
-                res = client.chat.completions.create(model=TEXT_MODEL, messages=[{"role": "user", "content": prompt}])
-                st.write(res.choices[0].message.content)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(f"<div class='metric-card'><div class='metric-value'>{metrics['wpm']}</div><div class='metric-label'>Words Per Min (WPM)</div></div>", unsafe_allow_html=True)
+                if metrics['wpm'] < 100: st.warning("Too Slow")
+                elif metrics['wpm'] > 160: st.warning("Too Fast")
+                else: st.success("Perfect Speed")
+                
+            with c2:
+                # Standard Deviation of Pitch indicates expressiveness
+                score = metrics['pitch_variability']
+                st.markdown(f"<div class='metric-card'><div class='metric-value'>{score}</div><div class='metric-label'>Intonation Score</div></div>", unsafe_allow_html=True)
+                if score < 20: st.warning("Monotone (Robot-like)")
+                else: st.success("Expressive")
+                
+            with c3:
+                 st.markdown(f"<div class='metric-card'><div class='metric-value'>{int(metrics['energy_score']*1000)}</div><div class='metric-label'>Energy Level</div></div>", unsafe_allow_html=True)
+            
+            st.divider()
+            st.markdown("### 📝 Text Accuracy")
+            st.markdown(visual_diff(target_text, spoken_text), unsafe_allow_html=True)
+            st.caption(f"You said: {spoken_text}")
 
-# === TAB 2: LISTENING GYM ===
+# === TAB 2: ROLEPLAY ===
 with tab2:
-    st.header("🎧 Native Ear Training")
-    st.write("Listen to the story WITHOUT seeing the text, then answer the question.")
+    if 'rp_history' not in st.session_state: st.session_state['rp_history'] = []
     
-    if st.button("🎲 Generate New Quiz"):
-        with st.spinner("Creating quiz..."):
-            prompt = """Generate a short 2-sentence story followed by a multiple choice question about it. 
-            Format: STORY|QUESTION|OPTION_A|OPTION_B|OPTION_C|CORRECT_ANSWER_LETTER"""
-            res = client.chat.completions.create(model=TEXT_MODEL, messages=[{"role": "user", "content": prompt}])
-            parts = res.choices[0].message.content.split("|")
-            
-            if len(parts) >= 6:
-                st.session_state['quiz_data'] = {
-                    "story": parts[0],
-                    "q": parts[1],
-                    "options": [parts[2], parts[3], parts[4]],
-                    "answer": parts[5].strip()
-                }
-                # Generate audio immediately
-                st.session_state['quiz_audio'] = generate_audio(parts[0], gender, emotion)
-            else:
-                st.error("AI Generation failed. Try again.")
-
-    if st.session_state['quiz_data']:
-        st.audio(st.session_state['quiz_audio'])
-        
-        with st.form("quiz_form"):
-            st.write(f"**Question:** {st.session_state['quiz_data']['q']}")
-            choice = st.radio("Choose:", st.session_state['quiz_data']['options'])
-            submitted = st.form_submit_button("Check Answer")
-            
-            if submitted:
-                # Simple logic to check answer (assuming options correspond to A, B, C order)
-                correct_opt = st.session_state['quiz_data']['options'][
-                    ord(st.session_state['quiz_data']['answer'].upper()) - 65
-                ]
-                
-                if choice == correct_opt:
-                    st.balloons()
-                    st.success("Correct!")
-                else:
-                    st.error(f"Wrong. The correct answer was: {correct_opt}")
-                
-                with st.expander("Show Transcript"):
-                    st.write(st.session_state['quiz_data']['story'])
-
-# === TAB 3: TONGUE TWISTERS ===
-with tab3:
-    st.header("🔥 Speed & Diction Challenge")
-    
-    twisters = {
-        "Beginner": "Fresh fried fish, fish fresh fried, fried fish fresh, fish fried fresh.",
-        "Intermediate": "The thirty-three thieves thought that they thrilled the throne throughout Thursday.",
-        "Expert": "Pad kid poured curd pulled cod."
-    }
-    
-    level = st.select_slider("Difficulty", options=["Beginner", "Intermediate", "Expert"])
-    target_twister = twisters[level]
-    
-    st.markdown(f"### {target_twister}")
-    
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Hear it (Fast)"):
-            path = generate_audio(target_twister, gender, "Strict") # Strict is usually faster/crisper
-            st.audio(path)
-    
-    tt_input = st.audio_input("Record your attempt")
-    
-    if tt_input:
-        spoken_tt = transcribe_audio(tt_input)
-        st.write(f"**You said:** {spoken_tt}")
-        
-        ratio = difflib.SequenceMatcher(None, target_twister.lower(), spoken_tt.lower()).ratio()
-        if ratio > 0.9:
-            st.success(f"🏆 Amazing! Accuracy: {int(ratio*100)}%")
-        elif ratio > 0.7:
-            st.warning(f"Good! Accuracy: {int(ratio*100)}%")
-        else:
-            st.error(f"Keep trying! Accuracy: {int(ratio*100)}%")
-
-# === TAB 4: AI ROLEPLAY ===
-with tab4:
-    st.header("🎭 Real-time Conversation")
-    
-    # Check for Autoplay Trigger
-    if st.session_state.get('autoplay_trigger') and st.session_state.get('last_audio_path'):
-        st.audio(st.session_state['last_audio_path'], autoplay=True)
-        st.session_state['autoplay_trigger'] = False # Reset trigger
-
-    scenarios = ["Doctor Visit", "Job Interview", "Ordering Coffee", "Immigration Officer"]
-    scenario = st.selectbox("Choose Scenario", scenarios)
-    
-    if st.button("🔄 Reset / Start New Chat"):
-        st.session_state['roleplay_history'] = [
-            {"role": "system", "content": f"Roleplay scenario: {scenario}. You are the AI character. Keep responses concise (under 30 words)."}
-        ]
-        # Initial greeting
-        start_prompt = f"Start a roleplay about {scenario}."
-        completion = client.chat.completions.create(model=TEXT_MODEL, messages=[{"role": "user", "content": start_prompt}])
-        greeting = completion.choices[0].message.content
-        st.session_state['roleplay_history'].append({"role": "assistant", "content": greeting})
-        
-        # Generate Audio
-        path = generate_audio(greeting, gender, emotion)
-        st.session_state['last_audio_path'] = path
-        st.session_state['autoplay_trigger'] = True
+    if st.button("Start New Scenario"):
+        st.session_state['rp_history'] = [{"role": "system", "content": "You are a barista. Be friendly."}]
+        intro = "Hi there! What can I get for you today?"
+        st.session_state['rp_history'].append({"role": "assistant", "content": intro})
+        path = generate_audio_sync(intro, gender, emotion)
+        st.session_state['last_audio'] = path
         st.rerun()
-
-    # Display Chat
-    chat_container = st.container()
-    with chat_container:
-        for msg in st.session_state['roleplay_history']:
-            if msg['role'] == "user":
-                st.markdown(f"<div class='chat-user'>👤 {msg['content']}</div>", unsafe_allow_html=True)
-            elif msg['role'] == "assistant":
-                st.markdown(f"<div class='chat-ai'>🤖 {msg['content']}</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='clear: both;'></div>", unsafe_allow_html=True)
-    st.divider()
-
-    # User Input
-    rp_audio = st.audio_input("Reply to the AI")
-    
-    if rp_audio:
-        # Check if we just processed this specific audio input (prevents double submit loops)
-        # Note: st.audio_input doesn't have a unique ID, so we check if the last message matches
         
-        with st.spinner("Listening..."):
-            user_text = transcribe_audio(rp_audio)
-        
-        if user_text:
-             # Basic debounce: Check if user_text is identical to the last user message? 
-             # (Not perfect but helps. Better: check length of history)
-            last_role = st.session_state['roleplay_history'][-1]['role']
+    for msg in st.session_state['rp_history']:
+        role_class = "chat-user" if msg['role'] == "user" else "chat-ai"
+        if msg['role'] != "system":
+            st.markdown(f"<div class='{role_class}'>{msg['content']}</div>", unsafe_allow_html=True)
             
-            if last_role == "assistant":
-                # 1. Add User Message
-                st.session_state['roleplay_history'].append({"role": "user", "content": user_text})
-                
-                # 2. Get AI Response
-                with st.spinner("AI thinking..."):
-                    ai_res = client.chat.completions.create(
-                        model=TEXT_MODEL, 
-                        messages=st.session_state['roleplay_history']
-                    )
-                    ai_text = ai_res.choices[0].message.content
-                    st.session_state['roleplay_history'].append({"role": "assistant", "content": ai_text})
-                    
-                    # 3. Generate Audio & Set Autoplay
-                    path = generate_audio(ai_text, gender, emotion)
-                    st.session_state['last_audio_path'] = path
-                    st.session_state['autoplay_trigger'] = True
-                    st.rerun()
-
-# === TAB 5: MOUTH LAB ===
-with tab5:
-    st.header("👄 Articulation Mirror")
-    st.info("Uses computer vision to overlay a face mesh on your lips. Helps with 'TH', 'R', and 'L' sounds.")
+    st.markdown("<div style='clear:both'></div>", unsafe_allow_html=True)
     
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        webrtc_streamer(
-            key="mouth-lab",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=MouthProcessor,
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-    with c2:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/35/IPA_chart_2020.svg/800px-IPA_chart_2020.svg.png", caption="IPA Chart Reference")
+    if 'last_audio' in st.session_state:
+        st.audio(st.session_state['last_audio'])
+        del st.session_state['last_audio'] # Play once
+        
+    rp_in = st.audio_input("Reply")
+    if rp_in:
+        txt = transcribe_audio(rp_in)
+        if txt:
+            st.session_state['rp_history'].append({"role": "user", "content": txt})
+            resp = client.chat.completions.create(model="llama-3.1-8b-instant", messages=st.session_state['rp_history']).choices[0].message.content
+            st.session_state['rp_history'].append({"role": "assistant", "content": resp})
+            path = generate_audio_sync(resp, gender, emotion)
+            st.session_state['last_audio'] = path
+            st.rerun()
+
+# === TAB 3: MOUTH LAB ===
+with tab3:
+    if MEDIAPIPE_AVAILABLE:
+        st.info("Start the camera to see the lip-sync mesh.")
+        webrtc_streamer(key="mouth", mode=WebRtcMode.SENDRECV, video_processor_factory=MouthProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}, media_stream_constraints={"video": True, "audio": False}, async_processing=True)
+    else:
+        st.error("MediaPipe is unavailable in this environment. Please check packages.txt")
