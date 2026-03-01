@@ -8,3 +8,5 @@ mediapipe
 asyncio
 streamlit-webrtc
 av
+librosa
+matplotlib
