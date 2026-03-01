@@ -10,284 +10,256 @@ import eng_to_ipa as ipa
 import cv2
 import av
 import librosa
-import matplotlib.pyplot as plt
 from groq import Groq
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="English Ultimate V10 Pro",
-    layout="wide",
-    page_icon="🦁",
-    initial_sidebar_state="expanded"
-)
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="English Ultimate V11", layout="wide", page_icon="🦁")
 
 # --- CSS STYLING ---
 st.markdown("""
 <style>
-    .main-header { font-size: 2.5rem; color: #4B0082; text-align: center; }
-    .metric-card {
-        background-color: #f0f2f6; border-radius: 10px; padding: 15px;
-        text-align: center; border: 1px solid #dcdcdc;
+    .big-font { font-size: 1.2rem; font-weight: 500; line-height: 1.6; }
+    .metric-box {
+        background: #f8f9fa; border-radius: 8px; padding: 15px; 
+        text-align: center; border: 1px solid #e9ecef;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
-    .metric-value { font-size: 1.5rem; font-weight: bold; color: #2c3e50; }
-    .metric-label { font-size: 0.9rem; color: #7f8c8d; }
-    .correct { color: #27ae60; font-weight: bold; }
-    .incorrect { color: #c0392b; font-weight: bold; text-decoration: line-through; }
-    .chat-user {
-        background-color: #d1ccc0; padding: 10px; border-radius: 15px 15px 0 15px;
-        margin: 5px 0; text-align: right; float: right; clear: both; max-width: 70%; color: black;
-    }
-    .chat-ai {
-        background-color: #dff9fb; padding: 10px; border-radius: 15px 15px 15px 0;
-        margin: 5px 0; text-align: left; float: left; clear: both; max-width: 70%; color: black;
-    }
+    .metric-val { font-size: 1.8rem; font-weight: 700; color: #4B0082; }
+    .metric-lbl { font-size: 0.9rem; color: #6c757d; text-transform: uppercase; letter-spacing: 1px; }
+    .correct { color: #2ecc71; font-weight: bold; }
+    .incorrect { color: #e74c3c; font-weight: bold; text-decoration: line-through; }
+    .correction { color: #f39c12; font-weight: bold; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- API SETUP ---
-if "GROQ_API_KEY" in st.secrets:
+try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-else:
-    os.environ["GROQ_API_KEY"] = "gsk_YOUR_API_KEY_HERE" # FALLBACK
+except:
+    os.environ["GROQ_API_KEY"] = "gsk_YOUR_API_KEY_HERE" # Replace for local dev
     client = Groq()
 
-# --- MEDIA PIPE SETUP (SAFE IMPORT) ---
-try:
-    import mediapipe as mp
-    mp_face_mesh = mp.solutions.face_mesh
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    MEDIAPIPE_AVAILABLE = True
-except Exception as e:
-    MEDIAPIPE_AVAILABLE = False
-    st.error(f"Visual Feedback Warning: MediaPipe failed to load. The Mouth Lab will not work. (Error: {e})")
+# --- SESSION STATE ---
+if 'practice_text' not in st.session_state: st.session_state['practice_text'] = ""
+if 'audio_path' not in st.session_state: st.session_state['audio_path'] = None
 
-# --- CORE FUNCTIONS ---
+# --- CORE LOGIC ---
 
-def analyze_prosody(audio_path, transcript):
-    """
-    Analyzes audio for pacing, pitch, and energy using Librosa (Free).
+def generate_content(prompt_type):
+    """Uses Groq to generate ANY kind of English practice material."""
+    system_prompt = """
+    You are an expert English Coach. 
+    Generate text based on the user's request. 
+    OUTPUT ONLY THE RAW TEXT TO BE SPOKEN. 
+    Do not add "Here is your text" or quotes.
     """
     try:
-        # Load Audio
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt_type}
+            ],
+            temperature=0.7
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error generating text: {e}"
+
+def analyze_voice_quality(audio_path, transcript):
+    """Uses Librosa to extract physical voice properties."""
+    try:
         y, sr = librosa.load(audio_path)
         duration = librosa.get_duration(y=y, sr=sr)
         
-        # 1. Pacing (WPM)
+        # 1. Speed (WPM)
         word_count = len(transcript.split())
         wpm = (word_count / duration) * 60
         
-        # 2. Pitch (Fundamental Frequency - F0)
-        # We use PYIN (Probabilistic YIN) to estimate pitch
-        f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
-        # Filter out silence/unvoiced parts
-        pitch_values = f0[~np.isnan(f0)]
+        # 2. Pitch Dynamics (Monotone vs Expressive)
+        f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
+        f0 = f0[~np.isnan(f0)]
+        pitch_std = np.std(f0) if len(f0) > 0 else 0
         
-        if len(pitch_values) > 0:
-            avg_pitch = np.mean(pitch_values)
-            pitch_std = np.std(pitch_values) # High std = Expressive, Low std = Monotone
-        else:
-            avg_pitch = 0
-            pitch_std = 0
-            
-        # 3. Energy (Root Mean Square)
-        rms = librosa.feature.rms(y=y)
-        avg_energy = np.mean(rms)
+        # 3. Pause Ratio (Silence Detection)
+        non_silent_intervals = librosa.effects.split(y, top_db=20)
+        non_silent_duration = sum(end - start for start, end in non_silent_intervals) / sr
+        pause_ratio = 1 - (non_silent_duration / duration)
 
         return {
-            "duration": duration,
-            "wpm": round(wpm, 1),
-            "pitch_variability": round(pitch_std, 1),
-            "avg_pitch": round(avg_pitch, 1),
-            "energy_score": round(avg_energy, 4)
+            "wpm": int(wpm),
+            "pitch_score": round(pitch_std, 1),
+            "pause_ratio": round(pause_ratio * 100, 1)
         }
-    except Exception as e:
+    except:
         return None
 
-def generate_audio_sync(text, gender, emotion):
-    """Sync wrapper for TTS"""
+async def generate_tts(text, gender, emotion):
+    """Async TTS Generation"""
     voice = "en-US-ChristopherNeural" if gender == "Male" else "en-US-AriaNeural"
-    emotions = {
-        "Neutral": {"rate": "+0%", "pitch": "+0Hz"},
-        "Happy":   {"rate": "+10%", "pitch": "+4Hz"},
-        "Sad":     {"rate": "-10%", "pitch": "-5Hz"},
-        "Strict":  {"rate": "-5%", "pitch": "-2Hz"},
-    }
-    e = emotions.get(emotion, emotions["Neutral"])
+    # Adjust physics of voice based on emotion
+    rates = {"Neutral": "+0%", "Happy": "+10%", "Sad": "-10%", "Strict": "-5%"}
+    pitches = {"Neutral": "+0Hz", "Happy": "+5Hz", "Sad": "-5Hz", "Strict": "-2Hz"}
     
+    communicate = edge_tts.Communicate(text, voice, rate=rates[emotion], pitch=pitches[emotion])
     fd, path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
-    
-    async def _gen():
-        communicate = edge_tts.Communicate(text, voice, rate=e['rate'], pitch=e['pitch'])
-        await communicate.save(path)
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-             asyncio.run(_gen())
-        else:
-             loop.run_until_complete(_gen())
-    except:
-        asyncio.run(_gen())
-        
+    await communicate.save(path)
     return path
 
-def transcribe_audio(audio_file):
-    if audio_file is None: return ""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(audio_file.read())
-        tmp_name = tmp.name
+def get_audio_sync(text, gender, emotion):
+    """Sync wrapper for TTS"""
     try:
-        with open(tmp_name, "rb") as f:
-            trans = client.audio.transcriptions.create(file=(tmp_name, f.read()), model="whisper-large-v3-turbo")
-        return trans.text
-    finally:
-        os.remove(tmp_name)
+        loop = asyncio.get_event_loop()
+        if loop.is_closed(): loop = asyncio.new_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+    
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(generate_tts(text, gender, emotion))
 
-def get_ipa(text):
-    try: return ipa.convert(text)
-    except: return text
-
-def visual_diff(target, spoken):
-    t_clean = target.translate(str.maketrans('', '', string.punctuation)).lower().split()
-    s_clean = spoken.translate(str.maketrans('', '', string.punctuation)).lower().split()
-    matcher = difflib.SequenceMatcher(None, t_clean, s_clean)
-    html = ""
+def get_visual_diff(target, spoken):
+    """Highlights errors in red and corrections in green."""
+    t_words = target.translate(str.maketrans('', '', string.punctuation)).lower().split()
+    s_words = spoken.translate(str.maketrans('', '', string.punctuation)).lower().split()
+    
+    matcher = difflib.SequenceMatcher(None, t_words, s_words)
+    html = []
+    
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == 'equal':
-            html += f"<span class='correct'>{' '.join(t_clean[i1:i2])}</span> "
+            html.append(f"<span class='correct'>{' '.join(t_words[i1:i2])}</span>")
         elif tag == 'replace':
-            html += f"<span class='incorrect'>{' '.join(t_clean[i1:i2])}</span> "
+            html.append(f"<span class='incorrect'>{' '.join(t_words[i1:i2])}</span> <span class='correction'>({' '.join(s_words[j1:j2])})</span>")
         elif tag == 'delete':
-            html += f"<span style='color:orange; text-decoration:line-through'>{' '.join(t_clean[i1:i2])}</span> "
-    return html
+            html.append(f"<span class='incorrect'>{' '.join(t_words[i1:i2])}</span>")
+        elif tag == 'insert':
+            html.append(f"<span class='correction'>({' '.join(s_words[j1:j2])})</span>")
+            
+    return " ".join(html)
 
-# --- WEBRTC PROCESSOR ---
-if MEDIAPIPE_AVAILABLE:
-    class MouthProcessor(VideoTransformerBase):
-        def __init__(self):
-            self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-
-        def transform(self, frame):
-            img = frame.to_ndarray(format="bgr24")
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(img_rgb)
-            if results.multi_face_landmarks:
-                for face_landmarks in results.multi_face_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image=img, landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_LIPS,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
-                    )
-            return img
-else:
-    class MouthProcessor(VideoTransformerBase):
-        def transform(self, frame): return frame.to_ndarray(format="bgr24")
-
-# --- UI LAYOUT ---
-st.title("🦁 English Ultimate V10 Pro")
-
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("Settings")
-    gender = st.selectbox("Voice", ["Male", "Female"])
-    emotion = st.selectbox("Emotion", ["Neutral", "Happy", "Sad", "Strict"])
-    st.info("New: Voice Analytics Engine Added (Librosa)")
-
-tab1, tab2, tab3 = st.tabs(["📊 Voice Analytics Lab", "🎭 Roleplay", "👄 Mouth Camera"])
-
-# === TAB 1: ANALYTICS LAB ===
-with tab1:
-    st.subheader("Deep Voice Analysis")
-    st.markdown("Read the text below to analyze your Pacing, Intonation, and Pronunciation.")
+    st.header("⚙️ Coach Settings")
+    gender = st.selectbox("AI Voice", ["Male", "Female"])
+    emotion = st.selectbox("Tone", ["Neutral", "Happy", "Sad", "Strict"])
+    st.divider()
     
-    target_text = st.text_area("Target Text", "The quick brown fox jumps over the lazy dog. It was a bright cold day in April, and the clocks were striking thirteen.")
+    # MOUTH LAB (Moved to Sidebar to keep main area clean)
+    with st.expander("📸 Mouth Shape Monitor"):
+        try:
+            import mediapipe as mp
+            mp_face_mesh = mp.solutions.face_mesh
+            
+            class MouthProcessor(VideoTransformerBase):
+                def __init__(self):
+                    self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+                def transform(self, frame):
+                    img = frame.to_ndarray(format="bgr24")
+                    res = self.face_mesh.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    if res.multi_face_landmarks:
+                        for fl in res.multi_face_landmarks:
+                            mp.solutions.drawing_utils.draw_landmarks(
+                                image=img, landmark_list=fl,
+                                connections=mp_face_mesh.FACEMESH_LIPS,
+                                landmark_drawing_spec=None,
+                                connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_contours_style()
+                            )
+                    return img
+
+            webrtc_streamer(key="mouth", mode=WebRtcMode.SENDRECV, video_processor_factory=MouthProcessor,
+                           rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                           media_stream_constraints={"video": True, "audio": False}, async_processing=True)
+        except Exception:
+            st.warning("Camera unavailable (MediaPipe missing).")
+
+# --- MAIN LAYOUT ---
+st.title("🦁 English Ultimate Generator")
+
+# 1. THE GENERATOR (The Main Tool)
+st.markdown("### 1️⃣ What do you want to practice?")
+col1, col2 = st.columns([4, 1])
+
+with col1:
+    user_topic = st.text_input("Enter topic, style, or type:", 
+                  placeholder="e.g., 'Hard tongue twister', 'Job interview answer about strengths', 'Story about winter'")
+
+with col2:
+    if st.button("🚀 Generate", use_container_width=True):
+        with st.spinner("Writing..."):
+            st.session_state['practice_text'] = generate_content(user_topic)
+            # Pre-generate the audio for the new text
+            st.session_state['audio_path'] = get_audio_sync(st.session_state['practice_text'], gender, emotion)
+
+# 2. THE PRACTICE AREA
+if st.session_state['practice_text']:
+    st.divider()
     
-    if st.button("Listen to Example"):
-        path = generate_audio_sync(target_text, gender, emotion)
-        st.audio(path)
-        
-    audio_input = st.audio_input("Record Analysis")
+    # Text Display
+    st.markdown("### 2️⃣ Read Aloud")
+    st.markdown(f"<div class='big-font'>{st.session_state['practice_text']}</div>", unsafe_allow_html=True)
+    
+    # Audio Player
+    if st.session_state['audio_path']:
+        if st.button("🔈 Hear Native Pronunciation"):
+            st.audio(st.session_state['audio_path'])
+    
+    st.markdown("### 3️⃣ Analyze Your Voice")
+    audio_input = st.audio_input("Record your attempt")
     
     if audio_input:
-        with st.spinner("Transcribing & Analyzing Physics of Audio..."):
-            # 1. Save to temp for Librosa
+        with st.spinner("Analyzing Physics of Voice..."):
+            # A. Transcribe
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp.write(audio_input.getvalue())
                 tmp_path = tmp.name
+                
+            with open(tmp_path, "rb") as f:
+                trans = client.audio.transcriptions.create(file=(tmp_path, f.read()), model="whisper-large-v3-turbo").text
             
-            # 2. Transcribe
-            spoken_text = transcribe_audio(audio_input)
-            
-            # 3. Analyze Physics (Free!)
-            metrics = analyze_prosody(tmp_path, spoken_text)
+            # B. Analyze (Librosa)
+            metrics = analyze_voice_quality(tmp_path, trans)
             os.remove(tmp_path)
             
-            # --- DISPLAY RESULTS ---
-            st.markdown("### 📈 Your Voice Metrics")
+            # C. Display Results
+            st.subheader("📊 Voice Analytics Report")
             
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"<div class='metric-card'><div class='metric-value'>{metrics['wpm']}</div><div class='metric-label'>Words Per Min (WPM)</div></div>", unsafe_allow_html=True)
-                if metrics['wpm'] < 100: st.warning("Too Slow")
-                elif metrics['wpm'] > 160: st.warning("Too Fast")
-                else: st.success("Perfect Speed")
-                
-            with c2:
-                # Standard Deviation of Pitch indicates expressiveness
-                score = metrics['pitch_variability']
-                st.markdown(f"<div class='metric-card'><div class='metric-value'>{score}</div><div class='metric-label'>Intonation Score</div></div>", unsafe_allow_html=True)
-                if score < 20: st.warning("Monotone (Robot-like)")
-                else: st.success("Expressive")
-                
-            with c3:
-                 st.markdown(f"<div class='metric-card'><div class='metric-value'>{int(metrics['energy_score']*1000)}</div><div class='metric-label'>Energy Level</div></div>", unsafe_allow_html=True)
+            # Metrics Row
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['wpm']}</div><div class='metric-lbl'>Words Per Min</div></div>", unsafe_allow_html=True)
+                if metrics['wpm'] < 110: st.caption("🐢 Too Slow")
+                elif metrics['wpm'] > 160: st.caption("🐇 Too Fast")
+                else: st.caption("✅ Perfect Pace")
+            
+            with m2:
+                # Standard deviation of pitch (higher = more expressive)
+                st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['pitch_score']}</div><div class='metric-lbl'>Intonation Score</div></div>", unsafe_allow_html=True)
+                if metrics['pitch_score'] < 15: st.caption("🤖 Monotone")
+                else: st.caption("🗣️ Expressive")
+
+            with m3:
+                st.markdown(f"<div class='metric-box'><div class='metric-val'>{metrics['pause_ratio']}%</div><div class='metric-lbl'>Pause Ratio</div></div>", unsafe_allow_html=True)
             
             st.divider()
-            st.markdown("### 📝 Text Accuracy")
-            st.markdown(visual_diff(target_text, spoken_text), unsafe_allow_html=True)
-            st.caption(f"You said: {spoken_text}")
-
-# === TAB 2: ROLEPLAY ===
-with tab2:
-    if 'rp_history' not in st.session_state: st.session_state['rp_history'] = []
-    
-    if st.button("Start New Scenario"):
-        st.session_state['rp_history'] = [{"role": "system", "content": "You are a barista. Be friendly."}]
-        intro = "Hi there! What can I get for you today?"
-        st.session_state['rp_history'].append({"role": "assistant", "content": intro})
-        path = generate_audio_sync(intro, gender, emotion)
-        st.session_state['last_audio'] = path
-        st.rerun()
-        
-    for msg in st.session_state['rp_history']:
-        role_class = "chat-user" if msg['role'] == "user" else "chat-ai"
-        if msg['role'] != "system":
-            st.markdown(f"<div class='{role_class}'>{msg['content']}</div>", unsafe_allow_html=True)
             
-    st.markdown("<div style='clear:both'></div>", unsafe_allow_html=True)
-    
-    if 'last_audio' in st.session_state:
-        st.audio(st.session_state['last_audio'])
-        del st.session_state['last_audio'] # Play once
-        
-    rp_in = st.audio_input("Reply")
-    if rp_in:
-        txt = transcribe_audio(rp_in)
-        if txt:
-            st.session_state['rp_history'].append({"role": "user", "content": txt})
-            resp = client.chat.completions.create(model="llama-3.1-8b-instant", messages=st.session_state['rp_history']).choices[0].message.content
-            st.session_state['rp_history'].append({"role": "assistant", "content": resp})
-            path = generate_audio_sync(resp, gender, emotion)
-            st.session_state['last_audio'] = path
-            st.rerun()
+            # Diff View
+            st.markdown("#### 📝 Pronunciation Accuracy")
+            st.markdown(get_visual_diff(st.session_state['practice_text'], trans), unsafe_allow_html=True)
+            
+            # AI Feedback
+            with st.expander("🤖 Detailed Coach Feedback"):
+                feedback_prompt = f"""
+                Analyze this English student.
+                Target: "{st.session_state['practice_text']}"
+                Said: "{trans}"
+                WPM: {metrics['wpm']}
+                
+                Give 3 specific tips to improve. Be direct.
+                """
+                res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": feedback_prompt}])
+                st.write(res.choices[0].message.content)
 
-# === TAB 3: MOUTH LAB ===
-with tab3:
-    if MEDIAPIPE_AVAILABLE:
-        st.info("Start the camera to see the lip-sync mesh.")
-        webrtc_streamer(key="mouth", mode=WebRtcMode.SENDRECV, video_processor_factory=MouthProcessor, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}, media_stream_constraints={"video": True, "audio": False}, async_processing=True)
-    else:
-        st.error("MediaPipe is unavailable in this environment. Please check packages.txt")
+else:
+    st.info("👆 Type a topic above to start practicing!")
