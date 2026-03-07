@@ -10,13 +10,16 @@ import eng_to_ipa as ipa
 import cv2
 import av
 import librosa
-import librosa.display
-import matplotlib.pyplot as plt
+import soundfile as sf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import noisereduce as nr
+import textstat
 from groq import Groq
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="English Ultimate V15 Pro", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="English Ultimate V16 Pro", layout="wide", page_icon="🦁")
 
 # --- CSS STYLING ---
 st.markdown("""
@@ -31,6 +34,7 @@ st.markdown("""
     .word-correct { color: #2e7d32; font-weight: bold; }
     .word-missing { color: #c62828; text-decoration: line-through; }
     .word-wrong { color: #ef6c00; font-style: italic; border-bottom: 1px dashed #ef6c00;}
+    .level-badge { display: inline-block; padding: 5px 12px; border-radius: 15px; background: #ffe0b2; color: #e65100; font-weight: bold; font-size: 0.9rem; margin-right: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,6 +50,7 @@ client = Groq(api_key=GROQ_API_KEY)
 if 'practice_text' not in st.session_state: st.session_state['practice_text'] = ""
 if 'coach_script' not in st.session_state: st.session_state['coach_script'] = ""
 if 'audio_ref_path' not in st.session_state: st.session_state['audio_ref_path'] = None
+if 'reading_level' not in st.session_state: st.session_state['reading_level'] = ""
 
 # --- HELPER FUNCTIONS ---
 
@@ -73,12 +78,7 @@ def mark_script(text, emotion):
 
 async def text_to_speech(text, gender, emotion):
     voice = "en-US-ChristopherNeural" if gender == "Male" else "en-US-AriaNeural"
-    params = {
-        "Neutral": {"r": "+0%", "p": "+0Hz"},
-        "Happy":   {"r": "+10%", "p": "+5Hz"},
-        "Sad":     {"r": "-10%", "p": "-5Hz"},
-        "Strict":  {"r": "-5%", "p": "-2Hz"},
-    }
+    params = {"Neutral": {"r": "+0%", "p": "+0Hz"}, "Happy": {"r": "+10%", "p": "+5Hz"}, "Sad": {"r": "-10%", "p": "-5Hz"}, "Strict": {"r": "-5%", "p": "-2Hz"}}
     p = params.get(emotion, params["Neutral"])
     
     communicate = edge_tts.Communicate(text, voice, rate=p['r'], pitch=p['p'])
@@ -96,11 +96,26 @@ def sync_tts_gen(text, gender, emotion):
     asyncio.set_event_loop(loop)
     return loop.run_until_complete(text_to_speech(text, gender, emotion))
 
+def get_text_metrics(text):
+    """Calculates US Grade Level and Reading Ease"""
+    grade = textstat.text_standard(text)
+    ease = textstat.flesch_reading_ease(text)
+    ease_desc = "Very Easy" if ease > 80 else "Conversational" if ease > 60 else "Advanced" if ease > 30 else "College Level"
+    return grade, f"{ease_desc} ({ease}/100)"
+
+def clean_audio_noise(input_path, output_path):
+    """Applies Studio-Grade Noise Gate to user's mic recording"""
+    data, rate = sf.read(input_path)
+    # Perform noise reduction
+    reduced_noise = nr.reduce_noise(y=data, sr=rate, prop_decrease=0.8)
+    sf.write(output_path, reduced_noise, rate)
+    return output_path
+
 def generate_visual_diff(target, spoken):
     t_words = target.lower().translate(str.maketrans('', '', string.punctuation)).split()
     s_words = spoken.lower().translate(str.maketrans('', '', string.punctuation)).split()
     matcher = difflib.SequenceMatcher(None, t_words, s_words)
-    html_output = []
+    html_output =[]
     
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == 'equal': html_output.append(f"<span class='word-correct'>{' '.join(t_words[i1:i2])}</span>")
@@ -110,65 +125,56 @@ def generate_visual_diff(target, spoken):
     return " ".join(html_output), matcher.ratio()
 
 def analyze_audio_physics(file_path, transcript):
-    """Calculates WPM, Pitch STD, and Energy"""
     try:
         y, sr = librosa.load(file_path)
         duration = librosa.get_duration(y=y, sr=sr)
         if duration < 0.5: return None
-        
         word_count = len(transcript.split())
         wpm = (word_count / duration) * 60
-        
         f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
         valid_f0 = f0[~np.isnan(f0)]
         pitch_std = np.std(valid_f0) if len(valid_f0) > 0 else 0
-        
         rms = librosa.feature.rms(y=y)
-        energy_avg = np.mean(rms)
-        
-        return {"wpm": int(wpm), "pitch_std": round(pitch_std, 1), "energy": round(energy_avg * 100, 1)}
+        return {"wpm": int(wpm), "pitch_std": round(pitch_std, 1), "energy": round(np.mean(rms) * 100, 1)}
     except:
         return None
 
-def plot_melody_comparison(ref_path, user_path):
-    """Generates the dual-graph showing Pitch (Rise/Fall) and Waveform (Pacing/Stress)"""
+def plot_interactive_melody(ref_path, user_path):
+    """Generates an Interactive Plotly Graph for Pitch and Stress/Volume"""
     try:
-        # Load audio files
         y_ref, sr_ref = librosa.load(ref_path)
         y_user, sr_user = librosa.load(user_path)
 
-        # Extract Pitch (F0)
+        # F0 (Pitch)
         f0_ref, _, _ = librosa.pyin(y_ref, fmin=60, fmax=500)
         f0_user, _, _ = librosa.pyin(y_user, fmin=60, fmax=500)
-
         times_ref = librosa.times_like(f0_ref, sr=sr_ref)
         times_user = librosa.times_like(f0_user, sr=sr_user)
 
-        # Create Plot
-        fig, ax = plt.subplots(2, 1, figsize=(10, 6))
-        fig.patch.set_facecolor('#f8f9fa')
+        # RMS (Volume / Loudness Stress)
+        rms_ref = librosa.feature.rms(y=y_ref)[0]
+        rms_user = librosa.feature.rms(y=y_user)[0]
+        times_rms_ref = librosa.times_like(rms_ref, sr=sr_ref)
+        times_rms_user = librosa.times_like(rms_user, sr=sr_user)
 
-        # 1. Target AI Audio
-        ax[0].set_facecolor('#ffffff')
-        librosa.display.waveshow(y_ref, sr=sr_ref, ax=ax[0], alpha=0.3, color='#4b0082') # Waveform
-        ax0_pitch = ax[0].twinx()
-        ax0_pitch.plot(times_ref, f0_ref, color='#9c27b0', linewidth=2.5) # Pitch Line
-        ax[0].set_title("🎯 Target: AI Native Speaker", fontweight="bold")
-        ax[0].set_ylabel("Volume (Stress)")
-        ax0_pitch.set_ylabel("Pitch (Rise/Fall)", color='#9c27b0')
-        ax[0].set_xticklabels([]) # Hide X axis for cleaner look
+        # Build Interactive Subplots
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=False, 
+                            subplot_titles=("🎯 Target: AI Native Speaker", "🎙️ Your Voice Recording (Noise Reduced)"),
+                            specs=[[{"secondary_y": True}],[{"secondary_y": True}]])
 
-        # 2. User Audio
-        ax[1].set_facecolor('#ffffff')
-        librosa.display.waveshow(y_user, sr=sr_user, ax=ax[1], alpha=0.3, color='#004d40') # Waveform
-        ax1_pitch = ax[1].twinx()
-        ax1_pitch.plot(times_user, f0_user, color='#009688', linewidth=2.5) # Pitch Line
-        ax[1].set_title("🎙️ Your Voice Recording", fontweight="bold")
-        ax[1].set_ylabel("Volume (Stress)")
-        ax1_pitch.set_ylabel("Pitch (Rise/Fall)", color='#009688')
-        ax[1].set_xlabel("Time (Seconds)")
+        # AI Trace: Volume (Shaded) + Pitch (Line)
+        fig.add_trace(go.Scatter(x=times_rms_ref, y=rms_ref, fill='tozeroy', name='AI Volume (Stress)', line=dict(color='rgba(156, 39, 176, 0.2)')), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=times_ref, y=f0_ref, mode='lines', name='AI Pitch (Tone)', line=dict(color='#9c27b0', width=3)), row=1, col=1, secondary_y=True)
 
-        plt.tight_layout()
+        # User Trace: Volume (Shaded) + Pitch (Line)
+        fig.add_trace(go.Scatter(x=times_rms_user, y=rms_user, fill='tozeroy', name='Your Volume', line=dict(color='rgba(0, 150, 136, 0.2)')), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=times_user, y=f0_user, mode='lines', name='Your Pitch', line=dict(color='#009688', width=3)), row=2, col=1, secondary_y=True)
+
+        # Layout adjustments
+        fig.update_yaxes(title_text="Volume", secondary_y=False, showgrid=False)
+        fig.update_yaxes(title_text="Pitch (Hz)", range=[60, 400], secondary_y=True, showgrid=True)
+        fig.update_layout(height=650, template="plotly_white", hovermode="x unified", margin=dict(l=20, r=20, t=60, b=20))
+        
         return fig
     except Exception as e:
         return None
@@ -177,18 +183,13 @@ def get_coach_feedback(target, spoken, metrics, emotion):
     pace_eval = "Good pace"
     if metrics['wpm'] < 110: pace_eval = "Too slow (Dragging)"
     elif metrics['wpm'] > 160: pace_eval = "Too fast (Rushing)"
-    
     prompt = f"""
     You are an Expert English Coach. Provide direct, encouraging feedback.
-    - Target Script: "{target}"
+    - Script: "{target}"
     - Student Said: "{spoken}"
     - Pace: {metrics['wpm']} WPM ({pace_eval})
     - Intonation Score: {metrics['pitch_std']} (Low < 15 is Monotone)
-    
-    Provide 3 short bullet points:
-    1. Pronunciation (Did they miss words?)
-    2. Pace & Rhythm.
-    3. Tone & Emotion.
+    Provide 3 short bullet points focusing on Pronunciation, Rhythm, and Emotion.
     """
     res = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}])
     return res.choices[0].message.content
@@ -199,7 +200,6 @@ with st.sidebar:
     gender = st.selectbox("AI Voice", ["Male", "Female"])
     emotion = st.selectbox("Target Emotion", ["Neutral", "Happy", "Sad", "Strict"])
     st.divider()
-    
     with st.expander("🎥 Mouth Shape Cam", expanded=False):
         try:
             import mediapipe as mp
@@ -218,8 +218,8 @@ with st.sidebar:
             st.warning("Camera unavailable on this server.")
 
 # --- MAIN LAYOUT ---
-st.title("🦁 English Ultimate V15 Pro")
-st.caption("Generate Script ➔ Listen ➔ Record ➔ Match the Melody")
+st.title("🦁 English Ultimate V16 Pro")
+st.caption("Studio-Grade Audio Cleanup ➔ Hoverable Pitch Graphs ➔ Reading Level Metrics")
 
 # 1. INPUT SECTION
 col_in1, col_in2 = st.columns([3, 1])
@@ -233,11 +233,17 @@ with col_in2:
                 st.session_state['practice_text'] = raw_text
                 st.session_state['coach_script'] = mark_script(raw_text, emotion)
                 st.session_state['audio_ref_path'] = sync_tts_gen(raw_text, gender, emotion)
+                st.session_state['reading_level'] = get_text_metrics(raw_text)
                 st.rerun()
 
 # 2. PRACTICE SECTION
 if st.session_state['practice_text']:
     st.divider()
+    
+    # Textstat Reading Level Badges
+    if st.session_state['reading_level']:
+        grade, ease = st.session_state['reading_level']
+        st.markdown(f"<div><span class='level-badge'>📚 {grade}</span><span class='level-badge'>🧠 {ease}</span></div><br>", unsafe_allow_html=True)
     
     tab_guide, tab_script, tab_ipa = st.tabs(["🎭 Acting Guide", "📄 Plain Text", "🗣️ IPA Pronunciation"])
     
@@ -264,60 +270,67 @@ if st.session_state['practice_text']:
     audio_val = st.audio_input("Press Mic to Start")
     
     if audio_val:
-        with st.spinner("Processing Voice Melody, Pitch, and Linguistics..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(audio_val.getvalue())
-                tmp_path = tmp.name
-            
-            # Transcription
-            with open(tmp_path, "rb") as f:
-                transcription = client.audio.transcriptions.create(file=(tmp_path, f.read()), model="whisper-large-v3-turbo").text
-            
-            # Extract Metrics
-            metrics = analyze_audio_physics(tmp_path, transcription)
-            
-            # Generate the Rise & Fall Graph
-            fig_melody = plot_melody_comparison(st.session_state['audio_ref_path'], tmp_path)
-            
-            if metrics:
-                # --- A. RISE & FALL MELODY GRAPH ---
-                st.markdown("### 🎶 Voice Melody & Pacing Matcher")
-                st.markdown("""
-                * **The Solid Line (Pitch):** Shows the rise and fall of your voice. Try to match the shape of the AI's curve! If your line is flat, you sound robotic.
-                * **The Shadow (Waveform):** Shows volume and pacing. If the AI has a flat gap, that means they paused. Make sure your gaps match theirs!
-                """)
-                if fig_melody:
-                    st.pyplot(fig_melody)
-                else:
-                    st.warning("Could not generate melody graph (audio might be too short).")
-
-                st.divider()
-
-                # --- B. VISUAL DIFF ---
-                st.markdown("### 🎯 Accuracy Breakdown")
-                diff_html, acc_ratio = generate_visual_diff(st.session_state['practice_text'], transcription)
-                st.markdown(f"<div style='font-size:1.2rem; background:#fff; padding:15px; border-radius:8px; border: 1px solid #ddd;'>{diff_html}</div>", unsafe_allow_html=True)
-                st.markdown(f"**Legend:** <span class='word-correct'>Green</span> = Perfect | <span class='word-missing'>Red</span> = Skipped | <span class='word-wrong'>Orange</span> = Mispronounced/Replaced", unsafe_allow_html=True)
-                st.progress(acc_ratio, text=f"Overall Pronunciation Accuracy: {int(acc_ratio*100)}%")
+        with st.spinner("1/3 Cleaning Audio Noise (Studio Gate)..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_raw:
+                tmp_raw.write(audio_val.getvalue())
+                raw_path = tmp_raw.name
                 
-                st.divider()
-
-                # --- C. METRICS & CRITIQUE ---
-                st.markdown("### 📊 Scoring & AI Feedback")
-                m1, m2, m3 = st.columns(3)
-                pace_color = "green" if 110 <= metrics['wpm'] <= 160 else "red"
-                with m1:
-                    st.markdown(f"<div class='metric-container'><div class='metric-value' style='color:{pace_color}'>{metrics['wpm']}</div><div class='metric-label'>Words/Min (Goal: 120-150)</div></div>", unsafe_allow_html=True)
-                with m2:
-                    st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['pitch_std']}</div><div class='metric-label'>Tone Dynamism (Low < 15)</div></div>", unsafe_allow_html=True)
-                with m3:
-                    st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['energy']}</div><div class='metric-label'>Loudness / Confidence</div></div>", unsafe_allow_html=True)
-                
-                feedback = get_coach_feedback(st.session_state['practice_text'], transcription, metrics, emotion)
-                st.markdown(f"<div class='feedback-box'>{feedback}</div>", unsafe_allow_html=True)
-                
-            else:
-                st.error("Audio recording was too short or silent. Please try again.")
+            clean_path = raw_path.replace(".wav", "_clean.wav")
+            clean_audio_noise(raw_path, clean_path)
             
-            # Clean up temp user file
-            os.remove(tmp_path)
+        with st.spinner("2/3 Transcribing & Linguistics Analysis..."):
+            with open(clean_path, "rb") as f:
+                transcription = client.audio.transcriptions.create(file=(clean_path, f.read()), model="whisper-large-v3-turbo").text
+            metrics = analyze_audio_physics(clean_path, transcription)
+            
+        with st.spinner("3/3 Rendering Interactive Studio Graphs..."):
+            fig_melody = plot_interactive_melody(st.session_state['audio_ref_path'], clean_path)
+            
+        if metrics:
+            # --- A. INTERACTIVE RISE & FALL MELODY GRAPH ---
+            st.markdown("### 🎶 Zoomable Melody & Pacing Matcher")
+            st.markdown("""
+            * **Hover your mouse** over the chart to see exact data points.
+            * **Drag to zoom in** on specific words or pauses. (Double-click to zoom out).
+            * Match your **Solid Line** (Tone/Pitch) and your **Shaded Area** (Loudness/Stress) to the AI!
+            """)
+            if fig_melody:
+                st.plotly_chart(fig_melody, use_container_width=True)
+
+            # Playback the CLEANED audio to the user so they can hear what the AI heard
+            st.markdown("**🎧 Listen to your Noise-Reduced Recording:**")
+            st.audio(clean_path)
+
+            st.divider()
+
+            # --- B. VISUAL DIFF ---
+            st.markdown("### 🎯 Accuracy Breakdown")
+            diff_html, acc_ratio = generate_visual_diff(st.session_state['practice_text'], transcription)
+            st.markdown(f"<div style='font-size:1.2rem; background:#fff; padding:15px; border-radius:8px; border: 1px solid #ddd;'>{diff_html}</div>", unsafe_allow_html=True)
+            st.markdown(f"**Legend:** <span class='word-correct'>Green</span> = Perfect | <span class='word-missing'>Red</span> = Skipped | <span class='word-wrong'>Orange</span> = Mispronounced/Replaced", unsafe_allow_html=True)
+            st.progress(acc_ratio, text=f"Overall Pronunciation Accuracy: {int(acc_ratio*100)}%")
+            
+            st.divider()
+
+            # --- C. METRICS & CRITIQUE ---
+            st.markdown("### 📊 Scoring & AI Feedback")
+            m1, m2, m3 = st.columns(3)
+            pace_color = "green" if 110 <= metrics['wpm'] <= 160 else "red"
+            with m1:
+                st.markdown(f"<div class='metric-container'><div class='metric-value' style='color:{pace_color}'>{metrics['wpm']}</div><div class='metric-label'>Words/Min (Goal: 120-150)</div></div>", unsafe_allow_html=True)
+            with m2:
+                st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['pitch_std']}</div><div class='metric-label'>Tone Dynamism (Low < 15)</div></div>", unsafe_allow_html=True)
+            with m3:
+                st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['energy']}</div><div class='metric-label'>Loudness / Confidence</div></div>", unsafe_allow_html=True)
+            
+            feedback = get_coach_feedback(st.session_state['practice_text'], transcription, metrics, emotion)
+            st.markdown(f"<div class='feedback-box'>{feedback}</div>", unsafe_allow_html=True)
+            
+        else:
+            st.error("Audio recording was too short or silent. Please try again.")
+        
+        # Clean up files
+        try:
+            os.remove(raw_path)
+            os.remove(clean_path)
+        except: pass
