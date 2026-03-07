@@ -8,4 +8,8 @@ mediapipe
 streamlit-webrtc
 av
 librosa
-matplotlib
+plotly           # For zoomable, interactive pitch/melody graphs
+noisereduce      # To clean your microphone audio
+scipy            # Required by noisereduce
+textstat         # To calculate the reading grade-level of the scripts
+pronouncing      # For syllable stress breakdown
