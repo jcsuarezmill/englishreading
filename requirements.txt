@@ -5,7 +5,6 @@ eng_to_ipa
 numpy
 opencv-python-headless
 mediapipe
-asyncio
 streamlit-webrtc
 av
 librosa
