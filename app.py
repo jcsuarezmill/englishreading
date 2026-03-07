@@ -16,7 +16,7 @@ from groq import Groq
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="English Ultimate V14 Pro", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="English Ultimate V15 Pro", layout="wide", page_icon="🦁")
 
 # --- CSS STYLING ---
 st.markdown("""
@@ -25,11 +25,9 @@ st.markdown("""
     .metric-container { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; text-align: center; margin-bottom: 10px; }
     .metric-value { font-size: 1.8rem; font-weight: 700; color: #4b0082; }
     .metric-label { font-size: 0.8rem; text-transform: uppercase; color: #6c757d; letter-spacing: 1px; }
-    .feedback-box { background-color: #e3f2fd; border-left: 5px solid #2196f3; padding: 15px; border-radius: 5px; }
+    .feedback-box { background-color: #e3f2fd; border-left: 5px solid #2196f3; padding: 15px; border-radius: 5px; margin-top: 10px;}
     .stress { font-weight: 900; text-decoration: underline; color: #d35400; }
     .pause { color: #c0392b; font-weight: bold; margin: 0 4px; }
-    
-    /* Word Diff Colors */
     .word-correct { color: #2e7d32; font-weight: bold; }
     .word-missing { color: #c62828; text-decoration: line-through; }
     .word-wrong { color: #ef6c00; font-style: italic; border-bottom: 1px dashed #ef6c00;}
@@ -47,7 +45,7 @@ client = Groq(api_key=GROQ_API_KEY)
 # --- SESSION STATE ---
 if 'practice_text' not in st.session_state: st.session_state['practice_text'] = ""
 if 'coach_script' not in st.session_state: st.session_state['coach_script'] = ""
-if 'audio_ref' not in st.session_state: st.session_state['audio_ref'] = None
+if 'audio_ref_path' not in st.session_state: st.session_state['audio_ref_path'] = None
 
 # --- HELPER FUNCTIONS ---
 
@@ -99,60 +97,81 @@ def sync_tts_gen(text, gender, emotion):
     return loop.run_until_complete(text_to_speech(text, gender, emotion))
 
 def generate_visual_diff(target, spoken):
-    """Creates a color-coded HTML string showing exact word errors."""
     t_words = target.lower().translate(str.maketrans('', '', string.punctuation)).split()
     s_words = spoken.lower().translate(str.maketrans('', '', string.punctuation)).split()
-    
     matcher = difflib.SequenceMatcher(None, t_words, s_words)
     html_output = []
     
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'equal':
-            html_output.append(f"<span class='word-correct'>{' '.join(t_words[i1:i2])}</span>")
-        elif tag == 'delete': # Word in target but skipped by user
-            html_output.append(f"<span class='word-missing'>{' '.join(t_words[i1:i2])}</span>")
-        elif tag == 'replace': # User said wrong word
-            html_output.append(f"<span class='word-wrong' title='You said: {' '.join(s_words[j1:j2])}'>{' '.join(t_words[i1:i2])}</span>")
+        if tag == 'equal': html_output.append(f"<span class='word-correct'>{' '.join(t_words[i1:i2])}</span>")
+        elif tag == 'delete': html_output.append(f"<span class='word-missing'>{' '.join(t_words[i1:i2])}</span>")
+        elif tag == 'replace': html_output.append(f"<span class='word-wrong' title='You said: {' '.join(s_words[j1:j2])}'>{' '.join(t_words[i1:i2])}</span>")
             
     return " ".join(html_output), matcher.ratio()
 
 def analyze_audio_physics(file_path, transcript):
+    """Calculates WPM, Pitch STD, and Energy"""
     try:
         y, sr = librosa.load(file_path)
         duration = librosa.get_duration(y=y, sr=sr)
-        if duration < 0.5: return None, None
+        if duration < 0.5: return None
         
-        # Linguistics & Pace
         word_count = len(transcript.split())
         wpm = (word_count / duration) * 60
         
-        # Pitch Tracking
         f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
         valid_f0 = f0[~np.isnan(f0)]
         pitch_std = np.std(valid_f0) if len(valid_f0) > 0 else 0
         
-        # Energy
         rms = librosa.feature.rms(y=y)
         energy_avg = np.mean(rms)
         
-        # Create Tone Visualizer Figure
-        fig, ax = plt.subplots(figsize=(10, 2.5))
-        fig.patch.set_facecolor('#f8f9fa')
-        ax.set_facecolor('#f8f9fa')
-        times = librosa.times_like(f0, sr=sr)
-        
-        # Plot Waveform (background) and Pitch (Foreground)
-        librosa.display.waveshow(y, sr=sr, ax=ax, alpha=0.3, color='gray')
-        ax2 = ax.twinx()
-        ax2.plot(times, f0, color='purple', linewidth=2, label='Voice Melody (Pitch)')
-        ax2.set_ylabel("Tone (Hz)")
-        ax.set_axis_off()
-        plt.tight_layout()
+        return {"wpm": int(wpm), "pitch_std": round(pitch_std, 1), "energy": round(energy_avg * 100, 1)}
+    except:
+        return None
 
-        metrics = {"wpm": int(wpm), "pitch_std": round(pitch_std, 1), "energy": round(energy_avg * 100, 1)}
-        return metrics, fig
+def plot_melody_comparison(ref_path, user_path):
+    """Generates the dual-graph showing Pitch (Rise/Fall) and Waveform (Pacing/Stress)"""
+    try:
+        # Load audio files
+        y_ref, sr_ref = librosa.load(ref_path)
+        y_user, sr_user = librosa.load(user_path)
+
+        # Extract Pitch (F0)
+        f0_ref, _, _ = librosa.pyin(y_ref, fmin=60, fmax=500)
+        f0_user, _, _ = librosa.pyin(y_user, fmin=60, fmax=500)
+
+        times_ref = librosa.times_like(f0_ref, sr=sr_ref)
+        times_user = librosa.times_like(f0_user, sr=sr_user)
+
+        # Create Plot
+        fig, ax = plt.subplots(2, 1, figsize=(10, 6))
+        fig.patch.set_facecolor('#f8f9fa')
+
+        # 1. Target AI Audio
+        ax[0].set_facecolor('#ffffff')
+        librosa.display.waveshow(y_ref, sr=sr_ref, ax=ax[0], alpha=0.3, color='#4b0082') # Waveform
+        ax0_pitch = ax[0].twinx()
+        ax0_pitch.plot(times_ref, f0_ref, color='#9c27b0', linewidth=2.5) # Pitch Line
+        ax[0].set_title("🎯 Target: AI Native Speaker", fontweight="bold")
+        ax[0].set_ylabel("Volume (Stress)")
+        ax0_pitch.set_ylabel("Pitch (Rise/Fall)", color='#9c27b0')
+        ax[0].set_xticklabels([]) # Hide X axis for cleaner look
+
+        # 2. User Audio
+        ax[1].set_facecolor('#ffffff')
+        librosa.display.waveshow(y_user, sr=sr_user, ax=ax[1], alpha=0.3, color='#004d40') # Waveform
+        ax1_pitch = ax[1].twinx()
+        ax1_pitch.plot(times_user, f0_user, color='#009688', linewidth=2.5) # Pitch Line
+        ax[1].set_title("🎙️ Your Voice Recording", fontweight="bold")
+        ax[1].set_ylabel("Volume (Stress)")
+        ax1_pitch.set_ylabel("Pitch (Rise/Fall)", color='#009688')
+        ax[1].set_xlabel("Time (Seconds)")
+
+        plt.tight_layout()
+        return fig
     except Exception as e:
-        return None, None
+        return None
 
 def get_coach_feedback(target, spoken, metrics, emotion):
     pace_eval = "Good pace"
@@ -160,15 +179,14 @@ def get_coach_feedback(target, spoken, metrics, emotion):
     elif metrics['wpm'] > 160: pace_eval = "Too fast (Rushing)"
     
     prompt = f"""
-    You are an Expert English Coach. Provide concise, direct feedback.
+    You are an Expert English Coach. Provide direct, encouraging feedback.
     - Target Script: "{target}"
     - Student Said: "{spoken}"
-    - Target Emotion: {emotion}
     - Pace: {metrics['wpm']} WPM ({pace_eval})
     - Intonation Score: {metrics['pitch_std']} (Low < 15 is Monotone)
     
-    Provide 3 bullet points:
-    1. Pronunciation & Missed Words.
+    Provide 3 short bullet points:
+    1. Pronunciation (Did they miss words?)
     2. Pace & Rhythm.
     3. Tone & Emotion.
     """
@@ -200,8 +218,8 @@ with st.sidebar:
             st.warning("Camera unavailable on this server.")
 
 # --- MAIN LAYOUT ---
-st.title("🦁 English Ultimate V14 Pro")
-st.caption("Generate Script ➔ Listen ➔ Record ➔ Deep Analysis")
+st.title("🦁 English Ultimate V15 Pro")
+st.caption("Generate Script ➔ Listen ➔ Record ➔ Match the Melody")
 
 # 1. INPUT SECTION
 col_in1, col_in2 = st.columns([3, 1])
@@ -214,14 +232,13 @@ with col_in2:
                 raw_text = generate_text(topic, emotion)
                 st.session_state['practice_text'] = raw_text
                 st.session_state['coach_script'] = mark_script(raw_text, emotion)
-                st.session_state['audio_ref'] = sync_tts_gen(raw_text, gender, emotion)
+                st.session_state['audio_ref_path'] = sync_tts_gen(raw_text, gender, emotion)
                 st.rerun()
 
 # 2. PRACTICE SECTION
 if st.session_state['practice_text']:
     st.divider()
     
-    # TABS FOR VIEWING
     tab_guide, tab_script, tab_ipa = st.tabs(["🎭 Acting Guide", "📄 Plain Text", "🗣️ IPA Pronunciation"])
     
     with tab_guide:
@@ -229,8 +246,8 @@ if st.session_state['practice_text']:
         formatted = st.session_state['coach_script'].replace("**", "<b>").replace("||", "<span class='pause'>||</span>")
         formatted = formatted.replace("<b>", "<span class='stress'>").replace("</b>", "</span>")
         st.markdown(f"<div class='big-text'>{formatted}</div>", unsafe_allow_html=True)
-        if st.session_state['audio_ref']:
-            st.audio(st.session_state['audio_ref'])
+        if st.session_state['audio_ref_path']:
+            st.audio(st.session_state['audio_ref_path'])
 
     with tab_script:
         st.markdown(f"<div class='big-text'>{st.session_state['practice_text']}</div>", unsafe_allow_html=True)
@@ -247,7 +264,7 @@ if st.session_state['practice_text']:
     audio_val = st.audio_input("Press Mic to Start")
     
     if audio_val:
-        with st.spinner("Analyzing Physics, Pitch, and Linguistics..."):
+        with st.spinner("Processing Voice Melody, Pitch, and Linguistics..."):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp.write(audio_val.getvalue())
                 tmp_path = tmp.name
@@ -256,32 +273,39 @@ if st.session_state['practice_text']:
             with open(tmp_path, "rb") as f:
                 transcription = client.audio.transcriptions.create(file=(tmp_path, f.read()), model="whisper-large-v3-turbo").text
             
-            # Physics & Melody
-            metrics, fig = analyze_audio_physics(tmp_path, transcription)
-            os.remove(tmp_path)
+            # Extract Metrics
+            metrics = analyze_audio_physics(tmp_path, transcription)
+            
+            # Generate the Rise & Fall Graph
+            fig_melody = plot_melody_comparison(st.session_state['audio_ref_path'], tmp_path)
             
             if metrics:
-                # --- A. VISUAL DIFF ---
+                # --- A. RISE & FALL MELODY GRAPH ---
+                st.markdown("### 🎶 Voice Melody & Pacing Matcher")
+                st.markdown("""
+                * **The Solid Line (Pitch):** Shows the rise and fall of your voice. Try to match the shape of the AI's curve! If your line is flat, you sound robotic.
+                * **The Shadow (Waveform):** Shows volume and pacing. If the AI has a flat gap, that means they paused. Make sure your gaps match theirs!
+                """)
+                if fig_melody:
+                    st.pyplot(fig_melody)
+                else:
+                    st.warning("Could not generate melody graph (audio might be too short).")
+
+                st.divider()
+
+                # --- B. VISUAL DIFF ---
                 st.markdown("### 🎯 Accuracy Breakdown")
                 diff_html, acc_ratio = generate_visual_diff(st.session_state['practice_text'], transcription)
                 st.markdown(f"<div style='font-size:1.2rem; background:#fff; padding:15px; border-radius:8px; border: 1px solid #ddd;'>{diff_html}</div>", unsafe_allow_html=True)
-                
                 st.markdown(f"**Legend:** <span class='word-correct'>Green</span> = Perfect | <span class='word-missing'>Red</span> = Skipped | <span class='word-wrong'>Orange</span> = Mispronounced/Replaced", unsafe_allow_html=True)
                 st.progress(acc_ratio, text=f"Overall Pronunciation Accuracy: {int(acc_ratio*100)}%")
                 
                 st.divider()
 
-                # --- B. PHYSICS & MELODY ---
-                st.markdown("### 📊 Voice Physics & Melody")
-                if fig:
-                    st.pyplot(fig)
-                    st.caption("Wavy purple line = Good Emotion. Flat purple line = Monotone (Robotic).")
-
+                # --- C. METRICS & CRITIQUE ---
+                st.markdown("### 📊 Scoring & AI Feedback")
                 m1, m2, m3 = st.columns(3)
-                
-                # Pace Context
                 pace_color = "green" if 110 <= metrics['wpm'] <= 160 else "red"
-                
                 with m1:
                     st.markdown(f"<div class='metric-container'><div class='metric-value' style='color:{pace_color}'>{metrics['wpm']}</div><div class='metric-label'>Words/Min (Goal: 120-150)</div></div>", unsafe_allow_html=True)
                 with m2:
@@ -289,10 +313,11 @@ if st.session_state['practice_text']:
                 with m3:
                     st.markdown(f"<div class='metric-container'><div class='metric-value'>{metrics['energy']}</div><div class='metric-label'>Loudness / Confidence</div></div>", unsafe_allow_html=True)
                 
-                # --- C. AI CRITIQUE ---
-                st.markdown("### 👨‍🏫 Coach's Final Verdict")
                 feedback = get_coach_feedback(st.session_state['practice_text'], transcription, metrics, emotion)
                 st.markdown(f"<div class='feedback-box'>{feedback}</div>", unsafe_allow_html=True)
                 
             else:
                 st.error("Audio recording was too short or silent. Please try again.")
+            
+            # Clean up temp user file
+            os.remove(tmp_path)
