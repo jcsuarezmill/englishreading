@@ -22,7 +22,10 @@ st.set_page_config(page_title="English Ultimate V17 Pro", layout="wide", page_ic
 
 # --- CSS STYLING ---
 st.markdown("""
-<style>
+<style>   
+#MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
     .big-text { font-size: 1.3rem; line-height: 1.6; font-family: sans-serif; }
     .metric-container { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; text-align: center; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.05);}
     .metric-value { font-size: 1.8rem; font-weight: 700; color: #4b0082; }
