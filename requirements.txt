@@ -13,3 +13,4 @@ noisereduce      # To clean your microphone audio
 scipy            # Required by noisereduce
 textstat         # To calculate the reading grade-level of the scripts
 pronouncing      # For syllable stress breakdown
+soundfile
